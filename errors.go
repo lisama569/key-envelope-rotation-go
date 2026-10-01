@@ -14,6 +14,10 @@ const (
 	ReasonUnknownKey Reason = "unknown_key"
 	// ReasonRevoked 密钥已被吊销：禁止新封装，也拒绝解封既有密文。
 	ReasonRevoked Reason = "revoked"
+	// ReasonKeyRetired 密钥世代已被显式清理：其历史密文一律拒绝，且不会尝试任何其他密钥。
+	ReasonKeyRetired Reason = "key_retired"
+	// ReasonCurrentKeyProtected 当前正在生效的密钥世代受保护，不允许被清理。
+	ReasonCurrentKeyProtected Reason = "current_key_protected"
 	// ReasonTampered 密文（头部或主体）被篡改，AEAD 校验失败。
 	ReasonTampered Reason = "tampered"
 	// ReasonNoCurrentKey 密钥环中没有当前有效密钥（空环）。
@@ -61,13 +65,15 @@ func (e *Error) Is(target error) bool {
 
 // 哨兵错误，仅用于 errors.Is 的原因归类。
 var (
-	ErrMalformed          = &Error{Reason: ReasonMalformed}
-	ErrUnsupportedVersion = &Error{Reason: ReasonUnsupportedVersion}
-	ErrUnknownKey         = &Error{Reason: ReasonUnknownKey}
-	ErrKeyRevoked         = &Error{Reason: ReasonRevoked}
-	ErrTampered           = &Error{Reason: ReasonTampered}
-	ErrNoCurrentKey       = &Error{Reason: ReasonNoCurrentKey}
-	ErrRecipientMismatch  = &Error{Reason: ReasonRecipientMismatch}
+	ErrMalformed           = &Error{Reason: ReasonMalformed}
+	ErrUnsupportedVersion  = &Error{Reason: ReasonUnsupportedVersion}
+	ErrUnknownKey          = &Error{Reason: ReasonUnknownKey}
+	ErrKeyRevoked          = &Error{Reason: ReasonRevoked}
+	ErrKeyRetired          = &Error{Reason: ReasonKeyRetired}
+	ErrCurrentKeyProtected = &Error{Reason: ReasonCurrentKeyProtected}
+	ErrTampered            = &Error{Reason: ReasonTampered}
+	ErrNoCurrentKey        = &Error{Reason: ReasonNoCurrentKey}
+	ErrRecipientMismatch   = &Error{Reason: ReasonRecipientMismatch}
 )
 
 func wrapErr(op string, keyID string, cause *Error, detail string) *Error {
