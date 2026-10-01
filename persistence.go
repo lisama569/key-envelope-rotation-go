@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 )
 
 // storedKey 是持久化用的密钥条目表示（含材料，仅用于本地落盘，禁止用于诊断导出）。
@@ -17,11 +18,18 @@ type storedKey struct {
 	RevokedAt int64  `json:"revoked_at,omitempty"`
 }
 
+// storedTombstone 是已清理密钥的墓碑记录，保证重载后清理判定依然稳定。
+type storedTombstone struct {
+	ID       string `json:"id"`
+	PrunedAt int64  `json:"pruned_at"`
+}
+
 // storedState 是密钥环的完整持久化快照。
 type storedState struct {
-	CurrentID string       `json:"current_id"`
-	NextVer   int          `json:"next_version"`
-	Keys      []*storedKey `json:"keys"`
+	CurrentID string            `json:"current_id"`
+	NextVer   int               `json:"next_version"`
+	Keys      []*storedKey      `json:"keys"`
+	Pruned    []storedTombstone `json:"pruned,omitempty"`
 }
 
 // ExportState 导出含密钥材料的完整状态快照（仅用于本地持久化/迁移）。
@@ -40,6 +48,10 @@ func (r *KeyRing) ExportState() ([]byte, error) {
 			RevokedAt: e.RevokedAt,
 		})
 	}
+	for id, at := range r.pruned {
+		st.Pruned = append(st.Pruned, storedTombstone{ID: id, PrunedAt: at})
+	}
+	sort.Slice(st.Pruned, func(i, j int) bool { return st.Pruned[i].ID < st.Pruned[j].ID })
 	data, err := json.MarshalIndent(&st, "", "  ")
 	if err != nil {
 		return nil, fmt.Errorf("导出密钥环状态失败: %w", err)
@@ -48,28 +60,99 @@ func (r *KeyRing) ExportState() ([]byte, error) {
 }
 
 // LoadState 从快照恢复密钥环，与环内既有内容合并；重复标识按冲突拒绝。
+//
+// 兼容旧版快照：旧格式中所有未吊销密钥都记为 "active"，加载时仅当前指针
+// 指向的密钥保持 active，其余按新语义降级为 retained。缺少 pruned 字段
+// 视为无清理记录。自相矛盾的快照（当前指针指向非 active 密钥、标识重复、
+// 密钥与墓碑冲突、版本计数回退等）一律明确拒绝，不恢复出不自洽的环。
 func (r *KeyRing) LoadState(data []byte) error {
 	const op = "keyring.load"
 	var st storedState
 	if err := json.Unmarshal(data, &st); err != nil {
 		return wrapErr(op, "", ErrMalformed, "状态快照JSON无法解析: "+err.Error())
 	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	maxVer := r.nextVersion
+
+	// 先在不触碰环的情况下做完整快照自洽性校验，全部通过后才合并。
+	seen := make(map[string]bool, len(st.Keys))
+	snapMaxVer := 0
 	for _, k := range st.Keys {
 		if k == nil || k.ID == "" {
 			return wrapErr(op, "", ErrMalformed, "存在缺少标识的密钥条目")
 		}
+		if seen[k.ID] {
+			return wrapErr(op, k.ID, ErrMalformed, "快照内密钥标识重复")
+		}
+		seen[k.ID] = true
 		state := KeyState(k.State)
-		if state != StateActive && state != StateRevoked {
+		if state != StateActive && state != StateRetained && state != StateRevoked {
 			return wrapErr(op, k.ID, ErrMalformed, "未知的密钥状态: "+k.State)
 		}
 		if len(k.Key) != keySize {
 			return wrapErr(op, k.ID, ErrMalformed, fmt.Sprintf("密钥材料长度非法: %d", len(k.Key)))
 		}
+		// 当前指针指向的密钥在快照中必须显式为 active，否则状态自相矛盾。
+		if k.ID == st.CurrentID && state != StateActive {
+			return wrapErr(op, k.ID, ErrMalformed,
+				fmt.Sprintf("快照当前密钥状态为 %s，与当前指针矛盾", state))
+		}
+		if k.Version > snapMaxVer {
+			snapMaxVer = k.Version
+		}
+	}
+	if len(st.Keys) > 0 && st.NextVer < snapMaxVer+1 {
+		return wrapErr(op, "", ErrMalformed,
+			fmt.Sprintf("版本计数回退: next_version=%d 小于已用最大版本 %d", st.NextVer, snapMaxVer))
+	}
+	tombSeen := make(map[string]bool, len(st.Pruned))
+	for _, tb := range st.Pruned {
+		if tb.ID == "" {
+			return wrapErr(op, "", ErrMalformed, "存在缺少标识的清理墓碑")
+		}
+		if tombSeen[tb.ID] {
+			return wrapErr(op, tb.ID, ErrMalformed, "快照内清理墓碑重复")
+		}
+		tombSeen[tb.ID] = true
+		if seen[tb.ID] {
+			return wrapErr(op, tb.ID, ErrMalformed, "密钥条目与清理墓碑冲突")
+		}
+		if tb.ID == st.CurrentID {
+			return wrapErr(op, tb.ID, ErrMalformed, "当前指针指向已清理密钥，状态矛盾")
+		}
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	// 与环内既有内容的冲突也在合并前统一检查，保证加载要么整体生效要么整体拒绝。
+	for _, k := range st.Keys {
 		if _, exists := r.entries[k.ID]; exists {
 			return wrapErr(op, k.ID, ErrMalformed, "密钥标识与环内既有条目冲突")
+		}
+		if _, wasPruned := r.pruned[k.ID]; wasPruned {
+			return wrapErr(op, k.ID, ErrMalformed, "密钥标识与环内已清理墓碑冲突")
+		}
+	}
+	maxVer := r.nextVersion
+	if st.NextVer > maxVer {
+		maxVer = st.NextVer
+	}
+	if st.CurrentID != "" {
+		// 当前指针校验也在合并前完成：必须能在（快照 ∪ 环）中解析到一把
+		// 合并后处于 active 阶段的密钥。
+		if cur, ok := r.entries[st.CurrentID]; ok {
+			if cur.State != StateActive {
+				return wrapErr(op, st.CurrentID, ErrMalformed,
+					fmt.Sprintf("快照当前密钥在环中处于 %s 阶段，状态不自洽", cur.State))
+			}
+		} else if !seen[st.CurrentID] {
+			return wrapErr(op, st.CurrentID, ErrUnknownKey, "快照当前密钥标识不在密钥列表中")
+		}
+		// 当前标识在快照密钥中的情形已在无锁校验阶段确认其快照状态为 active。
+	}
+	for _, k := range st.Keys {
+		state := KeyState(k.State)
+		// 旧版快照兼容：非当前的 active 密钥按新语义降级为 retained。
+		if state == StateActive && k.ID != st.CurrentID {
+			state = StateRetained
 		}
 		r.entries[k.ID] = &KeyEntry{
 			ID:        k.ID,
@@ -83,30 +166,32 @@ func (r *KeyRing) LoadState(data []byte) error {
 			maxVer = k.Version + 1
 		}
 	}
-	if st.CurrentID != "" {
-		cur, ok := r.entries[st.CurrentID]
-		if !ok {
-			return wrapErr(op, st.CurrentID, ErrUnknownKey, "快照当前密钥标识不在密钥列表中")
+	for _, tb := range st.Pruned {
+		if _, exists := r.pruned[tb.ID]; !exists {
+			r.pruned[tb.ID] = tb.PrunedAt
 		}
-		if cur.State == StateRevoked {
-			return wrapErr(op, st.CurrentID, ErrKeyRevoked, "快照当前密钥已被吊销")
-		}
-		r.current = st.CurrentID
 	}
-	if st.NextVer > maxVer {
-		maxVer = st.NextVer
+	if st.CurrentID != "" {
+		r.current = st.CurrentID
 	}
 	r.nextVersion = maxVer
 	return nil
 }
 
-// SaveToFile 将密钥环状态以 0600 权限原子写入文件（临时文件 + 重命名）。
+// SaveToFile 将密钥环状态以 0600 权限原子写入文件。
+//
+// 崩溃安全保证：上级目录不存在时自动创建；先写临时文件并 fsync，
+// 再通过 rename 原子替换目标，最后 fsync 目录确保持久。替换失败时
+// 原有文件保持可用、内容不被破坏。
 func (r *KeyRing) SaveToFile(path string) error {
 	data, err := r.ExportState()
 	if err != nil {
 		return err
 	}
 	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("创建状态文件上级目录失败: %w", err)
+	}
 	tmp, err := os.CreateTemp(dir, ".keyring-*.tmp")
 	if err != nil {
 		return fmt.Errorf("创建临时状态文件失败: %w", err)
@@ -121,11 +206,21 @@ func (r *KeyRing) SaveToFile(path string) error {
 		tmp.Close()
 		return fmt.Errorf("设置状态文件权限失败: %w", err)
 	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return fmt.Errorf("落盘临时状态文件失败: %w", err)
+	}
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("关闭状态文件失败: %w", err)
 	}
 	if err := os.Rename(tmpName, path); err != nil {
+		// rename 未生效，原文件（若存在）内容不受影响。
 		return fmt.Errorf("替换状态文件失败: %w", err)
+	}
+	// fsync 目录，保证 rename 结果在崩溃后依然可见。
+	if d, err := os.Open(dir); err == nil {
+		_ = d.Sync()
+		_ = d.Close()
 	}
 	return nil
 }

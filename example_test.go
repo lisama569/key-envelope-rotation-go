@@ -41,9 +41,12 @@ func Example() {
 		log.Fatal(err)
 	}
 
-	// 轮换：第 2 代成为当前密钥，第 1 代保留可解封历史密文
+	// 轮换：第 2 代成为当前密钥，第 1 代降级为 retained（仅解封历史密文）
 	k2, _ := ring.Rotate()
 	ct2, _ := ring.Seal("alice", []byte("第二代密钥保护的秘密"))
+
+	i1, _ := ring.Info(k1.ID)
+	fmt.Printf("轮换后 k1 阶段=%s（仅解历史密文）\n", i1.State)
 
 	pt1, used1, err := ring.Open("alice", ct1)
 	if err != nil {
@@ -60,13 +63,23 @@ func Example() {
 	_, _, err = ring.Open("alice", ct1)
 	fmt.Printf("吊销后解封 ct1 的判定: %s\n", classify(err))
 
-	// 诊断信息只含元数据，不含密钥材料
-	infos := ring.ListInfos()
-	fmt.Printf("密钥代数=%d, 当前=%s\n", len(infos), label(k2.ID, k1, k2))
+	// 按代清理第 1 代：材料移除，历史密文得到稳定可解释的 pruned 判定
+	if _, err := ring.Prune(k1.ID); err != nil {
+		log.Fatal(err)
+	}
+	_, _, err = ring.Open("alice", ct1)
+	fmt.Printf("清理后解封 ct1 的判定: %s\n", classify(err))
+
+	// 诊断信息只含元数据，不含密钥材料；统计可直接看出各阶段数量
+	st := ring.Stats()
+	fmt.Printf("环内密钥=%d, 当前=%s, 保留旧代=%d, 已清理=%d\n",
+		st.Total, label(k2.ID, k1, k2), st.Retained, st.Pruned)
 
 	// Output:
+	// 轮换后 k1 阶段=retained（仅解历史密文）
 	// ct1 用 k1 解封: "第一代密钥保护的秘密"
 	// ct2 用 k2 解封: "第二代密钥保护的秘密"
 	// 吊销后解封 ct1 的判定: revoked
-	// 密钥代数=2, 当前=k2
+	// 清理后解封 ct1 的判定: pruned
+	// 环内密钥=1, 当前=k2, 保留旧代=0, 已清理=1
 }

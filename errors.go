@@ -20,6 +20,11 @@ const (
 	ReasonNoCurrentKey Reason = "no_current_key"
 	// ReasonRecipientMismatch 解封接收方与封装备注的接收方不一致。
 	ReasonRecipientMismatch Reason = "recipient_mismatch"
+	// ReasonPruned 密钥已被按代清理：其历史密文得到稳定、可解释的拒绝，
+	// 与“标识从未存在”（unknown_key）和“格式错误”（malformed）明确区分。
+	ReasonPruned Reason = "pruned"
+	// ReasonCurrentKey 试图清理当前正在生效的密钥，被安全规则拒绝。
+	ReasonCurrentKey Reason = "current_key"
 )
 
 // Error 携带可区分的失败原因、涉及的密钥标识与上下文说明。
@@ -68,6 +73,8 @@ var (
 	ErrTampered           = &Error{Reason: ReasonTampered}
 	ErrNoCurrentKey       = &Error{Reason: ReasonNoCurrentKey}
 	ErrRecipientMismatch  = &Error{Reason: ReasonRecipientMismatch}
+	ErrKeyPruned          = &Error{Reason: ReasonPruned}
+	ErrKeyIsCurrent       = &Error{Reason: ReasonCurrentKey}
 )
 
 func wrapErr(op string, keyID string, cause *Error, detail string) *Error {
