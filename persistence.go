@@ -63,8 +63,15 @@ func (r *KeyRing) ExportState() ([]byte, error) {
 //
 // 兼容旧版快照：旧格式中所有未吊销密钥都记为 "active"，加载时仅当前指针
 // 指向的密钥保持 active，其余按新语义降级为 retained。缺少 pruned 字段
-// 视为无清理记录。自相矛盾的快照（当前指针指向非 active 密钥、标识重复、
-// 密钥与墓碑冲突、版本计数回退等）一律明确拒绝，不恢复出不自洽的环。
+// 视为无清理记录。自相矛盾的快照一律明确拒绝（malformed），不恢复出
+// 不自洽的环。加载前的自洽性校验范围：
+//   - 版本号必须是合法正整数，且在快照内、（快照 ∪ 环）内均唯一；
+//   - 阶段与吊销时间必须一致：只有 revoked 允许且必须携带有效 revoked_at，
+//     active/retained 携带吊销时间、或 revoked 缺少吊销时间均为字段冲突；
+//   - 当前指针必须指向一把 active 密钥，标识/墓碑不得相互冲突，版本计数不得回退。
+//
+// 所有校验在触碰环之前完成，加载是原子的：要么整体生效，要么整体拒绝，
+// 被拒绝的快照不会污染环内既有的密钥、阶段、统计与清理记录。
 func (r *KeyRing) LoadState(data []byte) error {
 	const op = "keyring.load"
 	var st storedState
@@ -74,6 +81,7 @@ func (r *KeyRing) LoadState(data []byte) error {
 
 	// 先在不触碰环的情况下做完整快照自洽性校验，全部通过后才合并。
 	seen := make(map[string]bool, len(st.Keys))
+	seenVer := make(map[int]string, len(st.Keys))
 	snapMaxVer := 0
 	for _, k := range st.Keys {
 		if k == nil || k.ID == "" {
@@ -87,8 +95,31 @@ func (r *KeyRing) LoadState(data []byte) error {
 		if state != StateActive && state != StateRetained && state != StateRevoked {
 			return wrapErr(op, k.ID, ErrMalformed, "未知的密钥状态: "+k.State)
 		}
+		// 版本号必须是合法正数：0、负数或缺失都无法表达密钥代际顺序。
+		if k.Version <= 0 {
+			return wrapErr(op, k.ID, ErrMalformed,
+				fmt.Sprintf("密钥版本号非法（必须为正整数）: version=%d", k.Version))
+		}
+		// 版本号在快照内必须唯一，否则无法区分代际新旧，排序与统计都会失真。
+		if other, dup := seenVer[k.Version]; dup {
+			return wrapErr(op, k.ID, ErrMalformed,
+				fmt.Sprintf("快照内密钥版本号重复: version=%d 同时属于 %s 与 %s", k.Version, other, k.ID))
+		}
+		seenVer[k.Version] = k.ID
 		if len(k.Key) != keySize {
 			return wrapErr(op, k.ID, ErrMalformed, fmt.Sprintf("密钥材料长度非法: %d", len(k.Key)))
+		}
+		// 阶段与吊销时间必须自洽：只有 revoked 允许带吊销时间，且必须带有效时间戳。
+		// 旧版快照中未吊销密钥不携带 revoked_at（零值），与此规则天然兼容。
+		if state == StateRevoked {
+			if k.RevokedAt <= 0 {
+				return wrapErr(op, k.ID, ErrMalformed,
+					"密钥状态为 revoked 但缺少有效吊销时间（revoked_at 必须为正数）")
+			}
+		} else if k.RevokedAt != 0 {
+			return wrapErr(op, k.ID, ErrMalformed,
+				fmt.Sprintf("密钥状态为 %s（未吊销）却携带吊销时间 revoked_at=%d，字段冲突",
+					state, k.RevokedAt))
 		}
 		// 当前指针指向的密钥在快照中必须显式为 active，否则状态自相矛盾。
 		if k.ID == st.CurrentID && state != StateActive {
@@ -129,6 +160,14 @@ func (r *KeyRing) LoadState(data []byte) error {
 		}
 		if _, wasPruned := r.pruned[k.ID]; wasPruned {
 			return wrapErr(op, k.ID, ErrMalformed, "密钥标识与环内已清理墓碑冲突")
+		}
+		// 版本号在（快照 ∪ 环）范围内也必须唯一：不同标识占用同一版本号会让
+		// 合并后的环无法按版本区分代际，诊断/排序/统计全部失真。
+		for _, e := range r.entries {
+			if e.Version == k.Version {
+				return wrapErr(op, k.ID, ErrMalformed,
+					fmt.Sprintf("密钥版本号与环内既有条目冲突: version=%d 已被 %s 占用", k.Version, e.ID))
+			}
 		}
 	}
 	maxVer := r.nextVersion
